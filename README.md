@@ -6,24 +6,38 @@ An automated release path for two Node.js services (a content **publishing API**
 
 ## Architecture
 
+### 1. Release pipeline
+
+```mermaid
+flowchart TD
+    A[Merge to main] --> B[Lint and unit tests]
+    B --> C[Docker build]
+    C --> D[Trivy scan and SBOM check]
+    D --> E[Push image to ECR]
+    E --> F[Deploy dev]
+    F --> G[Deploy staging]
+    G --> H[Manual approval]
+    H --> I[Deploy prod]
+```
+
+### 2. What happens in each environment
+
 ```mermaid
 flowchart LR
-    Dev[Developer merges to main] --> CI
+    P[terraform plan] --> AP[terraform apply saved plan] --> R[ASG instance refresh] --> S[Smoke tests] --> T[Tag image as promoted]
+```
 
-    subgraph CI [Azure Pipelines: CI]
-        T[Lint + unit tests] --> B[Docker build] --> S[Trivy scan + SBOM] --> P[Push to ECR]
-    end
+### 3. Runtime
 
-    P --> D1[Deploy dev] --> D2[Deploy staging] --> D3[Deploy prod]
-
-    subgraph ENV [Each environment]
-        PL[terraform plan] --> AP[terraform apply saved plan] --> IR[ASG instance refresh] --> SM[Smoke tests] --> PR[Tag image as promoted]
-    end
-
-    ALB[Public ALB] -->|/publishing/*| ASG1[ASG: publishing-api]
-    ALB -->|/streaming/*| ASG2[ASG: streaming-api]
-    ASG1 --> CW[CloudWatch Logs + alarms]
-    ASG2 --> CW
+```mermaid
+flowchart LR
+    U[Users] --> ALB[Public ALB]
+    ALB -->|/publishing/*| A1[ASG: publishing-api]
+    ALB -->|/streaming/*| A2[ASG: streaming-api]
+    A1 --> CW[CloudWatch logs and alarms]
+    A2 --> CW
+    ECR[(ECR)] -.->|image pull| A1
+    ECR -.->|image pull| A2
 ```
 
 Traffic flow: **ALB** (public subnets) → path-based routing → **EC2 Auto Scaling groups** (private subnets, 2 to 3 AZs). Each instance pulls the exact image tag from ECR and runs it with Docker.
