@@ -1,0 +1,172 @@
+# azure-pipelines.yml
+# Media Granite Grid Delivery Platform
+# Azure Pipelines (orchestration) -> AWS (EC2 Auto Scaling, ECR, Terraform-managed infra)
+
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    exclude:
+      - docs/**
+      - '*.md'
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: media-common            # AWS_REGION, ECR_ACCOUNT_ID
+  - name: ciConnection
+    value: aws-media-tools         # AWS service connection for the shared tools/ECR account
+  - name: imageTag
+    value: build-$(Build.BuildId)  # one immutable tag per run, promoted unchanged
+  - name: ecrRegistry
+    value: $(ECR_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com
+  - name: isMain
+    value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+  - name: tfVersion
+    value: '1.9.8'
+  - name: trivyVersion             # pin every scanner to a version you have vetted
+    value: '0.56.2'
+  - name: syftVersion
+    value: '1.14.0'
+  - name: grypeVersion
+    value: '0.82.0'
+
+stages:
+  # ===================================================================== CI
+  - stage: CI
+    displayName: Test, build, scan
+    jobs:
+      - job: Test
+        displayName: Lint and unit tests
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '20.x'
+
+          - task: Cache@2
+            displayName: Cache npm
+            inputs:
+              key: 'npm | "$(Agent.OS)" | services/**/package-lock.json'
+              path: $(Pipeline.Workspace)/.npm
+
+          - script: |
+              set -euo pipefail
+              for svc in publishing-api streaming-api; do
+                echo "===== $svc ====="
+                cd "$(Build.SourcesDirectory)/services/$svc"
+                npm ci --cache "$(Pipeline.Workspace)/.npm"
+                npm run lint
+                JEST_JUNIT_OUTPUT_NAME="$svc.xml" \
+                  npm test -- --ci --reporters=default --reporters=jest-junit
+              done
+            displayName: npm ci, lint, unit tests
+            env:
+              JEST_JUNIT_OUTPUT_DIR: $(Build.SourcesDirectory)/test-results
+
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: 'test-results/*.xml'
+              testRunTitle: 'Media unit tests'
+
+      - job: Build
+        displayName: Build, scan, SBOM, push
+        dependsOn: Test
+        strategy:
+          matrix:
+            publishing:
+              service: publishing-api
+            streaming:
+              service: streaming-api
+        steps:
+          - script: |
+              set -euo pipefail
+              docker build \
+                --label org.opencontainers.image.revision=$(Build.SourceVersion) \
+                --label org.opencontainers.image.version=$(imageTag) \
+                -t $(ecrRegistry)/media/$(service):$(imageTag) \
+                services/$(service)
+            displayName: docker build $(service)
+
+          - script: |
+              set -euo pipefail
+              BASE=https://raw.githubusercontent.com
+              curl -sSfL $BASE/aquasecurity/trivy/main/contrib/install.sh \
+                | sudo sh -s -- -b /usr/local/bin v$(trivyVersion)
+              curl -sSfL $BASE/anchore/syft/main/install.sh \
+                | sudo sh -s -- -b /usr/local/bin v$(syftVersion)
+              curl -sSfL $BASE/anchore/grype/main/install.sh \
+                | sudo sh -s -- -b /usr/local/bin v$(grypeVersion)
+            displayName: Install scanners (pinned)
+
+          - script: |
+              set -euo pipefail
+              IMG=$(ecrRegistry)/media/$(service):$(imageTag)
+              OUT=$(Build.ArtifactStagingDirectory)/security
+              mkdir -p "$OUT"
+              # 1) Image vulnerability scan - fail on fixable HIGH/CRITICAL
+              trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed \
+                "$IMG" | tee "$OUT/trivy-$(service).txt"
+              # 2) Generate SBOM (CycloneDX) and gate on it
+              syft "$IMG" -o cyclonedx-json > "$OUT/sbom-$(service).cdx.json"
+              grype "sbom:$OUT/sbom-$(service).cdx.json" --fail-on high
+            displayName: Image scan + SBOM check
+
+          - publish: $(Build.ArtifactStagingDirectory)/security
+            artifact: security-$(service)
+            condition: succeededOrFailed()
+            displayName: Publish scan reports and SBOM
+
+          - task: AWSShellScript@1
+            displayName: Push to ECR (main only)
+            condition: and(succeeded(), eq(variables.isMain, 'true'))
+            inputs:
+              awsCredentials: ${{ variables.ciConnection }}
+              regionName: $(AWS_REGION)
+              scriptType: inline
+              inlineScript: |
+                set -euo pipefail
+                aws ecr get-login-password \
+                  | docker login --username AWS --password-stdin $(ecrRegistry)
+                docker push $(ecrRegistry)/media/$(service):$(imageTag)
+
+  # ============================================================ DEPLOYMENTS
+  - template: templates/deploy-env.yml
+    parameters:
+      envName: dev
+      adoEnvironment: media-dev
+      awsConnection: aws-media-dev
+      ecrConnection: aws-media-tools
+      dependsOn: CI
+      requiredTag: ''                # dev accepts any image built on main
+      promoteTag: dev-passed
+
+  - template: templates/deploy-env.yml
+    parameters:
+      envName: staging
+      adoEnvironment: media-staging
+      awsConnection: aws-media-staging
+      ecrConnection: aws-media-tools
+      dependsOn: Deploy_dev
+      requiredTag: dev-passed        # promotion rule: must have passed dev
+      promoteTag: staging-passed
+
+  - template: templates/deploy-env.yml
+    parameters:
+      envName: prod
+      adoEnvironment: media-prod     # approvals + business-hours check set on this env
+      awsConnection: aws-media-prod
+      ecrConnection: aws-media-tools
+      dependsOn: Deploy_staging
+      requiredTag: staging-passed    # promotion rule: must have passed staging
+      promoteTag: prod-released
